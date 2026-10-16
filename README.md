@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from etl_decorators.csv import parse_csv
+from etl_decorators.download import download
 from etl_decorators.html import parse_html
 from etl_decorators.json import parse_json, parse_jsonl
 from etl_decorators.logging import log
@@ -85,6 +86,22 @@ def extract_html_title() -> str:
 @parse_xml(extract="//item", extract_as_collection=True)
 def extract_xml_items() -> str:
     return "<root><item>a</item><item>b</item></root>"
+
+
+# ------------------
+# Download decorator
+# ------------------
+
+
+@download("my/favorite/path")
+def url_of(name: str) -> str:
+    return f"https://example.org/files/{name}"
+
+
+def fetch_remote() -> None:
+    stream = url_of("data.bin")  # DownloadStream: readable binary io object
+    _ = stream.read()
+    _type = stream.content_type  # e.g. "application/octet-stream" (or None)
 
 
 # ------------------
@@ -174,6 +191,9 @@ def main() -> None:
     _payload = extract_json()
     _events = list(extract_jsonl())
 
+    # Download with disk cache (resumable)
+    fetch_remote()
+
     # Stream processing
     for rows in stream_rows():
         load_batch(rows)
@@ -227,6 +247,51 @@ if __name__ == "__main__":
 - User documentation: [`etl_decorators.xml.parse_xml`](doc/parse_xml.md)
 - Developer notes / code layout: [`src/etl_decorators/xml/README.md`](src/etl_decorators/xml/README.md)
 - Tests: [`tests/xml/`](tests/xml/)
+
+### Downloading
+
+#### `etl_decorators.download`
+
+- Install: none required (pure standard library; `tqdm` is used for the optional
+  progress bar if installed)
+- User documentation: none yet — see the module docstring in
+  [`src/etl_decorators/download.py`](src/etl_decorators/download.py)
+- Tests: [`tests/test_download.py`](tests/test_download.py)
+
+`download` streams a URL to the caller while caching it on disk, resumably:
+
+```python
+from etl_decorators.download import download
+
+@download("my/favorite/path")
+def url_of(name):               # any function / method returning a str
+    return f"http://example.org/{name}"
+
+stream = url_of("file.bin")     # -> DownloadStream (a readable binary io object)
+data = stream.read()
+
+stream = download("my/favorite/path")("http://example.org")   # direct use on a string
+stream.content_type             # e.g. "text/html" (or None)
+stream.charset                  # e.g. "utf-8"     (or None)
+```
+
+Key points:
+
+- The returned [`DownloadStream`](src/etl_decorators/download.py:69) is a readable
+  binary io object; the download starts lazily on the first read and reading blocks
+  until data is available. `as_text_stream()` decodes it (using the server's charset
+  by default) for line iteration / text reads.
+- Each URL is cached on disk under the given directory
+  (e.g. `https://example.org/directory/thing.zip` →
+  `my/favorite/path/https/example.org/directory/thing.zip`), with JSON metadata in a
+  sibling `.DOWNLOAD` file (url, etag, last_modified, content_type, total,
+  downloaded, complete).
+- Interrupted downloads resume automatically (via `Range` / `If-Range`, when the
+  server provides an ETag or Last-Modified validator); completed downloads are
+  served from the cache with no network access.
+- `progress_bar=True` shows a progress bar on stderr (tqdm if installed, else a
+  built-in bar); `timeout=` sets the network timeout (default 30 s). Also works as a
+  bare `@download` (default cache directory `"download"`).
 
 ### Caching
 
