@@ -40,7 +40,9 @@ def _setup_attribute_set_listeners() -> None:
     """
 
     def on_mapper_configured(mapper, class_):  # noqa: ANN001
-        if mapper.non_primary:
+        # ``Mapper.non_primary`` was removed in SQLAlchemy 2.0; the attribute is
+        # absent (not merely False) there, so use a defaulted access.
+        if getattr(mapper, "non_primary", False):
             return
 
         for prop in mapper.column_attrs:
