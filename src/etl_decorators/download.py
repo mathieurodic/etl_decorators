@@ -21,6 +21,18 @@ Layout on disk (path "my/favorite/path"):
                                              last_modified, content_type, total,
                                              downloaded, complete)
 
+Progress can be observed three ways, all fed by the same events: `progress_bar=True` draws a bar on
+stderr, `on_progress(downloaded, total)` calls your function with the running byte count, and
+`stream.progress` polls `Progress(downloaded, total, complete)` from any thread without blocking.
+
+Reading while downloading is the intended use of the stream: the worker buffers at most `max_buffer`
+bytes (8 MiB by default) ahead of the reader and then blocks, so a slow reader applies backpressure
+rather than pulling a whole archive into memory.
+
+Lifetime: closing the stream, or letting it be garbage-collected, cancels the background download at
+the next chunk boundary. The bytes already written stay on disk with their sidecar, so downloading
+the same URL again resumes where it stopped.
+
 Name clashes: if "http://h/mammals" is cached as a file and "http://h/mammals/cats" arrives,
 "mammals" is turned into a directory and the first page moves to "mammals/.INDEX" (its
 metadata to "mammals/.INDEX.DOWNLOAD"). Whenever a URL's path is a directory, its content
@@ -40,15 +52,17 @@ import threading
 import time
 import uuid
 import urllib.error
+import weakref
 from email.message import Message
 import urllib.request
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from urllib.parse import quote, urlsplit
 
-__all__ = ["download", "DownloadStream"]
+__all__ = ["download", "DownloadStream", "Progress"]
 
 CHUNK_SIZE = 64 * 1024
+DEFAULT_MAX_BUFFER = 8 * 1024 * 1024  # bounded read-ahead; the writer blocks past this (backpressure)
 META_SUFFIX = ".DOWNLOAD"
 INDEX_NAME = ".INDEX"  # content of a URL whose path is a directory (other URLs live below it)
 
@@ -63,6 +77,44 @@ def _lock_for(path: Path) -> threading.Lock:
         return _locks.setdefault(key, threading.Lock())
 
 
+class Progress(NamedTuple):
+    """Snapshot of a download's progress, returned by `DownloadStream.progress`."""
+    downloaded: int        # bytes written for this URL (replayed plus freshly fetched)
+    total: Optional[int]   # expected size, or None when the server sent no Content-Length
+    complete: bool         # True once the whole file is on disk, even if the reader stopped early
+
+
+class _ProgressState:
+    """Thread-safe progress of one download: the source of truth behind `on_progress`.
+
+    The worker thread writes it; any thread reads `snapshot()`. `complete` turns true once
+    the whole file is on disk, whether or not the reader drained the stream.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._downloaded = 0
+        self._total: Optional[int] = None
+        self._complete = False
+
+    def set(self, downloaded: int, total: Optional[int]) -> None:
+        with self._lock:
+            self._downloaded = downloaded
+            self._total = total
+
+    def set_downloaded(self, downloaded: int) -> None:
+        with self._lock:
+            self._downloaded = downloaded
+
+    def set_complete(self) -> None:
+        with self._lock:
+            self._complete = True
+
+    def snapshot(self) -> Progress:
+        with self._lock:
+            return Progress(self._downloaded, self._total, self._complete)
+
+
 # --------------------------------------------------------------------------- stream
 
 
@@ -74,19 +126,28 @@ class DownloadStream(io.RawIOBase):
     The download itself starts lazily, on the first read (or an explicit start()).
     """
 
-    def __init__(self, starter: Callable[["DownloadStream"], None]):
+    def __init__(self, starter: Callable[["DownloadStream"], None],
+                 max_buffer: int = DEFAULT_MAX_BUFFER):
         super().__init__()
         self._starter = starter
         self._start_lock = threading.Lock()
         self._started = False
         self._cond = threading.Condition()
         self._chunks: collections.deque[bytes] = collections.deque()
+        self._buffered = 0                # bytes currently queued ahead of the reader
+        self._max_buffer = max(1, max_buffer)  # feed() blocks once this much is queued
         self._eof = False
         self._error: Optional[BaseException] = None
         self._content_type: Optional[str] = None
         self._charset: Optional[str] = None
         self._headers_known = False
         self._headers_ready = threading.Event()
+        self._progress = _ProgressState()
+        self._cancelled = threading.Event()
+        # The worker holds only a weak reference to us, so we can be collected mid-download.
+        # When that happens (or on close()) the finalizer stops the fetch; io.IOBase.__del__
+        # also calls close(). Either way the partial file and its sidecar stay resumable.
+        weakref.finalize(self, self._cancelled.set)
 
     # ---- writer side
     def _set_content_type(self, raw_header: Optional[str]) -> None:
@@ -96,10 +157,19 @@ class DownloadStream(io.RawIOBase):
         self._headers_ready.set()
 
     def feed(self, data: bytes) -> None:
+        chunk = bytes(data)
         with self._cond:
+            # Backpressure: once `max_buffer` bytes are queued ahead of the reader, the worker
+            # blocks here instead of reading the network unboundedly, so a slow reader slows the
+            # download rather than buffering the whole file in memory. A chunk larger than the
+            # bound is still accepted while the buffer is empty, to avoid a stall.
+            while (not self.closed and self._buffered > 0
+                   and self._buffered + len(chunk) > self._max_buffer):
+                self._cond.wait()
             if self.closed:
-                return  # reader left; the worker keeps filling the file on disk
-            self._chunks.append(bytes(data))
+                return  # reader left; the fetch is being cancelled, drop remaining chunks
+            self._chunks.append(chunk)
+            self._buffered += len(chunk)
             self._cond.notify_all()
 
     def finish(self, error: Optional[BaseException] = None) -> None:
@@ -137,6 +207,18 @@ class DownloadStream(io.RawIOBase):
         self._wait_headers()
         return self._charset
 
+    @property
+    def progress(self) -> Progress:
+        """Current `Progress` (downloaded, total, complete), safe to poll from any thread.
+
+        Unlike `content_type`/`charset` this never blocks and never starts the download:
+        before the first read it reports `(0, None, False)`. `total` stays None until the
+        server's Content-Length is known (and forever if it sends none). `complete` turns
+        true once the whole file is on disk — including when the reader stopped early, in
+        which case polling is the only completion signal. Read-only.
+        """
+        return self._progress.snapshot()
+
     def as_text_stream(self, encoding: Optional[str] = None, errors: str = "strict",
                        newline: Optional[str] = None) -> io.TextIOWrapper:
         """This stream decoded as text (line iteration, readline, read(n chars)...).
@@ -173,15 +255,21 @@ class DownloadStream(io.RawIOBase):
                 view[:n] = head[:n]
                 if n < len(head):
                     self._chunks.appendleft(head[n:])
+                self._buffered -= n
+                self._cond.notify_all()  # room freed: unblock a writer waiting on backpressure
                 return n
             if self._error is not None:
                 raise self._error
             return 0  # EOF (or closed)
 
     def close(self) -> None:
+        # Closing the reader abandons the download: the worker stops at the next chunk
+        # boundary, leaving a partial file and its sidecar, so a later call resumes it.
+        self._cancelled.set()
         with self._cond:
             self._chunks.clear()
-            self._cond.notify_all()
+            self._buffered = 0
+            self._cond.notify_all()  # wakes blocked readers and a writer waiting on backpressure
         super().close()
 
 
@@ -282,19 +370,54 @@ def _save_meta(path: Path, meta: dict) -> None:
     os.replace(tmp, path)  # atomic: a crash never leaves half-written metadata
 
 
-def _replay(path: Path, stream: DownloadStream, nbytes: int) -> None:
-    """Push the first `nbytes` bytes already on disk into the stream."""
+def _replay(path: Path, stream: DownloadStream, nbytes: int,
+            on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
+            cancel: Optional[threading.Event] = None) -> bool:
+    """Push the first `nbytes` bytes already on disk into the stream.
+
+    Returns False if `cancel` was set part-way through, so the caller stops."""
     remaining = nbytes
+    done = 0
     with open(path, "rb") as f:
         while remaining > 0:
+            if cancel is not None and cancel.is_set():
+                return False
             chunk = f.read(min(CHUNK_SIZE, remaining))
             if not chunk:
                 raise IOError(f"{path} is shorter than its metadata claims")
             stream.feed(chunk)
             remaining -= len(chunk)
+            done += len(chunk)
+            stream._progress.set_downloaded(done)
+            if on_progress is not None:
+                on_progress(done, nbytes)
+    return True
 
 
 # --------------------------------------------------------------------------- worker
+
+
+class _Abandoned(Exception):
+    """Raised when the reader vanished (closed or collected) and the stream is gone."""
+
+
+class _StreamProxy:
+    """Forwards to a `DownloadStream` held by weak reference.
+
+    The worker thread keeps one of these instead of the stream itself, so the stream stays
+    collectible: a strong reference in the thread would pin it for the whole download. Each
+    forwarded call briefly resolves the weak reference; once the stream is gone, the proxy
+    raises `_Abandoned`, which stops the fetch and leaves the partial file resumable.
+    """
+
+    def __init__(self, ref: "weakref.ref[DownloadStream]"):
+        self._ref = ref
+
+    def __getattr__(self, name: str):
+        stream = self._ref()
+        if stream is None:
+            raise _Abandoned()
+        return getattr(stream, name)
 
 
 class _Progress:
@@ -343,7 +466,9 @@ class _Progress:
 
 
 def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
-           progress_bar: bool = False) -> None:
+           progress_bar: bool = False,
+           on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
+           cancel: Optional[threading.Event] = None) -> None:
     _make_room(url, logical)
     # If other URLs live below this one, its content is the '.INDEX' file inside.
     dest = logical / INDEX_NAME if logical.is_dir() else logical
@@ -361,7 +486,10 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
     # 1. Already complete: serve from disk, no network.
     if meta is not None and meta.get("complete") and have == int(meta.get("downloaded", -1)):
         stream._set_content_type(meta.get("content_type"))
-        _replay(dest, stream, have)
+        stream._progress.set(have, int(meta.get("total", have)))
+        if not _replay(dest, stream, have, on_progress, cancel):
+            return
+        stream._progress.set_complete()
         return
 
     # 2. Try to resume (needs a validator so we know the remote content didn't change).
@@ -381,7 +509,10 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
                     meta["complete"] = True
                     _save_meta(meta_path, meta)
                     stream._set_content_type(meta.get("content_type"))
-                    _replay(dest, stream, offset)
+                    stream._progress.set(offset, offset)
+                    if not _replay(dest, stream, offset, on_progress, cancel):
+                        return
+                    stream._progress.set_complete()
                     return
                 continue  # otherwise retry from scratch
             raise
@@ -401,11 +532,17 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
                 offset + int(length) if length else None)
             with open(dest, "r+b") as f:
                 f.truncate(offset)  # drop any bytes written after the last metadata update
-            _replay(dest, stream, offset)  # the reader sees the whole file, not just the tail
+            # the reader sees the whole file, not just the tail
+            if not _replay(dest, stream, offset, on_progress, cancel):
+                return
         else:  # fresh download, or the server ignored/refused the range
             offset = 0
             mode = "wb"
             total = int(length) if length else None
+
+        # both branches have set `offset` and `total` by now; publish them (resume replays
+        # from 0, so `downloaded` will climb from `offset` to `total` below)
+        stream._progress.set(offset, total)
 
         meta = {
             "url": url,
@@ -422,6 +559,9 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
         try:
             with open(dest, mode) as f:
                 while True:
+                    if cancel is not None and cancel.is_set():
+                        _save_meta(meta_path, meta)  # keep `downloaded` in sync with the file
+                        return  # partial file + sidecar stay resumable
                     chunk = resp.read(CHUNK_SIZE)
                     if not chunk:
                         break
@@ -432,6 +572,9 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
                     stream.feed(chunk)
                     if bar:
                         bar.update(len(chunk))
+                    stream._progress.set(meta["downloaded"], total)
+                    if on_progress is not None:
+                        on_progress(meta["downloaded"], total)
         finally:
             if bar:
                 bar.close()
@@ -442,33 +585,51 @@ def _fetch(url: str, logical: Path, stream: DownloadStream, timeout: float,
     if meta["total"] is None:
         meta["total"] = meta["downloaded"]
     _save_meta(meta_path, meta)
+    stream._progress.set(meta["downloaded"], meta["total"])
+    stream._progress.set_complete()
 
 
 # --------------------------------------------------------------------------- public API
 
 
 class _Download:
-    def __init__(self, path: str, timeout: float, progress_bar: bool = False):
+    def __init__(self, path: str, timeout: float, progress_bar: bool = False,
+                 on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
+                 max_buffer: int = DEFAULT_MAX_BUFFER):
         self.base = Path(path)
         self.timeout = timeout
         self.progress_bar = progress_bar
+        self.on_progress = on_progress
+        self.max_buffer = max_buffer
 
     def _open(self, url: str) -> DownloadStream:
         dest = _local_path(self.base, url)
 
         def run(stream: DownloadStream) -> None:
+            # Hold only a weak reference so the stream can be collected mid-download: a strong
+            # reference in the worker would pin the object for the whole download, and its
+            # death (which must cancel the fetch) could never happen.
+            ref = weakref.ref(stream)
+            cancel = stream._cancelled
+            proxy = _StreamProxy(ref)
+
             def work() -> None:
                 try:
                     with _lock_for(dest):
-                        _fetch(url, dest, stream, self.timeout, self.progress_bar)
+                        _fetch(url, dest, proxy, self.timeout, self.progress_bar,
+                               self.on_progress, cancel)
+                except _Abandoned:
+                    pass  # the reader is gone; the partial file and sidecar stay resumable
                 except BaseException as e:  # surfaced to the reader
-                    stream.finish(e)
+                    if (alive := ref()) is not None:
+                        alive.finish(e)
                 else:
-                    stream.finish()
+                    if (alive := ref()) is not None:
+                        alive.finish()
 
             threading.Thread(target=work, name=f"download:{url}", daemon=True).start()
 
-        return DownloadStream(run)
+        return DownloadStream(run, self.max_buffer)
 
     def __call__(self, target):
         if isinstance(target, str):  # applied directly to a string
@@ -485,14 +646,35 @@ class _Download:
         raise TypeError("expected a string or a callable returning a string")
 
 
-def download(path: str = "download", progress_bar: bool = False, *, timeout: float = 30.0):
+def download(path: str = "download", progress_bar: bool = False, *, timeout: float = 30.0,
+             on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
+             max_buffer: int = DEFAULT_MAX_BUFFER):
     """download("some/dir") -> something you can apply to a URL string or decorate a
     str-returning callable with. Either way you get back a readable DownloadStream.
     Also works as a bare `@download`.
 
     progress_bar: show a progress bar on stderr while bytes are actually being downloaded
     (not when the file is served from the cache). Uses tqdm if installed, else a built-in bar.
+
+    on_progress(downloaded, total): called with the running byte count as data arrives (and as a
+    resumed or cached file is replayed to the reader). `total` is the expected size in bytes, or
+    None when the server sent no Content-Length. Use it for logging, metrics or a custom progress
+    display; `progress_bar` is a built-in consumer of the same events. The callback runs on the
+    download thread, so it must be quick and must not read from the stream.
+
+    max_buffer: how many bytes the worker may buffer ahead of the reader (default 8 MiB). A reader
+    that lags applies backpressure — the worker blocks in feed() rather than reading the network
+    unboundedly — so parsing an archive as it arrives never buffers the whole file in memory.
+
+    The returned stream also exposes a polled view: `stream.progress` returns a `Progress`
+    (downloaded, total, complete) snapshot from any thread without blocking, and `complete`
+    becomes true once the file is on disk even if the reader stopped early.
+
+    Lifetime: the download runs on a daemon thread that holds only a weak reference to the
+    stream. Closing the stream, or letting it be garbage-collected, cancels the download at
+    the next chunk boundary; the bytes already written (and their sidecar) stay on disk, so a
+    later `download()` of the same URL resumes from there.
     """
     if callable(path):  # bare @download
-        return _Download("download", timeout, progress_bar)(path)
-    return _Download(path, timeout, progress_bar)
+        return _Download("download", timeout, progress_bar, on_progress, max_buffer)(path)
+    return _Download(path, timeout, progress_bar, on_progress, max_buffer)

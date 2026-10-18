@@ -275,12 +275,38 @@ stream.content_type             # e.g. "text/html" (or None)
 stream.charset                  # e.g. "utf-8"     (or None)
 ```
 
+Observe progress while the download runs — push (callback) or pull (poll):
+
+```python
+stream = download("my/favorite/path", on_progress=lambda done, total:
+                  print(f"{done}/{total if total is not None else '?'}"))(url)
+
+stream.progress          # -> Progress(downloaded=…, total=…, complete=…)  (poll, never blocks)
+```
+
 Key points:
 
-- The returned [`DownloadStream`](src/etl_decorators/download.py:69) is a readable
+- The returned [`DownloadStream`](src/etl_decorators/download.py:111) is a readable
   binary io object; the download starts lazily on the first read and reading blocks
   until data is available. `as_text_stream()` decodes it (using the server's charset
   by default) for line iteration / text reads.
+- **Calling `download(...)(url)` starts no network request.** The fetch begins on the
+  first read (`start()`, `.content_type` or `.charset`), so a bare call does nothing
+  until the stream is consumed. A caller that reads to EOF gets its completion signal
+  from the read returning 0; a caller that stops before EOF can poll `stream.progress`,
+  whose `complete` turns true once the file is on disk.
+- **Read a file while it downloads.** The worker feeds each chunk to the reader as it
+  arrives, so a consumer (e.g. a tar parser) can process bytes before the download
+  finishes. Read-ahead is **bounded**: the worker buffers at most `max_buffer` bytes
+  (default 8 MiB, set per call) and then blocks, so a reader slower than the network
+  applies backpressure instead of pulling the whole file into memory. Draining the
+  stream to EOF is what unlocks the fastest possible download.
+- **The download runs on a daemon thread that holds only a weak reference to the
+  stream.** Closing the stream (which also happens automatically when it is garbage
+  collected, via `io.IOBase.__del__`) cancels the fetch at the next chunk boundary, so
+  abandoning a stream does not leave a thread downloading in the background. The bytes
+  already written and their `.DOWNLOAD` sidecar stay on disk, so a later
+  `download(url)` **resumes** from where it stopped.
 - Each URL is cached on disk under the given directory
   (e.g. `https://example.org/directory/thing.zip` →
   `my/favorite/path/https/example.org/directory/thing.zip`), with JSON metadata in a
@@ -288,10 +314,19 @@ Key points:
   downloaded, complete).
 - Interrupted downloads resume automatically (via `Range` / `If-Range`, when the
   server provides an ETag or Last-Modified validator); completed downloads are
-  served from the cache with no network access.
-- `progress_bar=True` shows a progress bar on stderr (tqdm if installed, else a
-  built-in bar); `timeout=` sets the network timeout (default 30 s). Also works as a
-  bare `@download` (default cache directory `"download"`).
+  served from the cache with no network access. The `.DOWNLOAD` sidecar is the
+  durable state across processes.
+- Progress is observable three ways, all fed by the same events: `progress_bar=True`
+  shows a bar on stderr (tqdm if installed, else a built-in bar);
+  `on_progress(downloaded, total)` calls your function with the running byte count;
+  and `stream.progress` **polls** a `Progress(downloaded, total, complete)` snapshot
+  from any thread without blocking. `total` is `None` when the server sends no
+  `Content-Length`. `timeout=` sets the network timeout (default 30 s). Also works as
+  a bare `@download` (default cache directory `"download"`).
+- The integrity check is `Content-Length`-only: if the server's total is known and
+  the bytes written differ, the download ends with `IOError("incomplete download")`.
+  There is no checksum. A cancelled (closed/collected) download is *not* an error: it
+  simply stops early, leaving a resumable partial file and sidecar.
 
 ### Caching
 
